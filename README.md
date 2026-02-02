@@ -1,6 +1,6 @@
-# extidd_py
+# packerpy
 
-A python implementation of the Extender IDD protocol.
+A rapid protocol prototyping library that provides convenient message specification syntax and server/client interfaces.
 
 ## Architecture: Network Communications
 
