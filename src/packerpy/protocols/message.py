@@ -30,6 +30,7 @@ class Message(ABC):
     - size: Size parameter for certain encoders
     - numlist: Fixed array size
     - serializer: Serializer instance (BytesSerializer/JSONSerializer) for this field
+    - static: Static/constant value for this field (always this value)
 
     Supported built-in types:
     - Native Python: "int", "str", "float", "double", "bool", "bytes"
@@ -74,6 +75,14 @@ class Message(ABC):
                 "header": {"type": HeaderPartial, "serializer": BytesSerializer()},
                 "payload": {"type": PayloadPartial, "serializer": JSONSerializer()}
             }
+
+        # Static field values (constants)
+        class ProtocolMessage(Message):
+            fields = {
+                "magic_number": {"type": "int(32)", "static": 0x12345678},
+                "version": {"type": "int(16)", "static": 1},
+                "data": {"type": "str"}
+            }
     """
 
     encoding: Encoding = Encoding.BIG_ENDIAN
@@ -82,9 +91,13 @@ class Message(ABC):
 
     def __init__(self, **kwargs):
         """Initialize with field values."""
-        for field_name in self.fields:
+        for field_name, field_spec in self.fields.items():
+            # Check if field has a static value
+            if "static" in field_spec:
+                # Always use the static value, ignore kwargs
+                setattr(self, field_name, field_spec["static"])
             # Only set attributes that are provided in kwargs
-            if field_name in kwargs:
+            elif field_name in kwargs:
                 setattr(self, field_name, kwargs.get(field_name))
 
     def _resolve_field_reference(self, field_ref: str) -> Any:
@@ -195,8 +208,11 @@ class Message(ABC):
                     # Skip this field
                     continue
 
+            # Use static value if specified
+            if "static" in field_spec:
+                value = field_spec["static"]
             # Compute field value if needed (for auto-computed fields)
-            if any(
+            elif any(
                 k in field_spec
                 for k in ["length_of", "size_of", "value_from", "compute"]
             ):
@@ -376,7 +392,11 @@ class Message(ABC):
         context = BitPackingContext(byteorder)
 
         for field_name, field_spec in self.fields.items():
-            value = getattr(self, field_name)
+            # Use static value if specified
+            if "static" in field_spec:
+                value = field_spec["static"]
+            else:
+                value = getattr(self, field_name)
             field_type = field_spec.get("type")
 
             # Handle arrays of bitwise fields first
@@ -465,6 +485,27 @@ class Message(ABC):
         for field_name, field_spec in cls.fields.items():
             field_type = field_spec.get("type")
 
+            # Check if field has a static value
+            if "static" in field_spec:
+                # Deserialize and verify it matches the static value
+                if field_type == "bit":
+                    bit_count = field_spec.get("bits", 1)
+                    signed = field_spec.get("signed", False)
+                    value = context.unpack_bits(bit_count)
+                    if signed and (value & (1 << (bit_count - 1))):
+                        value -= 1 << bit_count
+                else:
+                    raise ValueError(
+                        f"Static values in bitwise mode only support 'bit' type, got '{field_type}'"
+                    )
+                expected = field_spec["static"]
+                if value != expected:
+                    raise ValueError(
+                        f"Field '{field_name}': expected static value {expected}, got {value}"
+                    )
+                kwargs[field_name] = expected
+                continue
+
             # Handle arrays of bitwise fields first
             if "numlist" in field_spec and field_type == "bit":
                 bit_count = field_spec.get("bits", 1)
@@ -531,6 +572,22 @@ class Message(ABC):
         kwargs = {}
 
         for field_name, field_spec in cls.fields.items():
+            # Check if field has a static value
+            if "static" in field_spec:
+                # Deserialize and verify it matches the static value
+                value, consumed = cls._deserialize_value(
+                    data[offset:], field_spec, byteorder, kwargs
+                )
+                expected = field_spec["static"]
+                if value != expected:
+                    raise ValueError(
+                        f"Field '{field_name}': expected static value {expected}, got {value}"
+                    )
+                # Set the static value (not the deserialized one, for consistency)
+                kwargs[field_name] = expected
+                offset += consumed
+                continue
+
             # Check if this field should be conditionally included
             if "condition" in field_spec:
                 condition_fn = field_spec["condition"]
