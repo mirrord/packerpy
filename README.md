@@ -33,7 +33,7 @@ uv sync
 ## Project Structure
 
 ```
-extidd_py/
+packerpy/
 ├── server.py          # High-level Server implementation
 ├── client.py          # High-level Client implementation
 ├── protocols/         # Protocol and Message definitions
@@ -56,8 +56,8 @@ The easiest way to use this package is through the high-level `Server` and `Clie
 
 ```python
 import asyncio
-from extidd_py import Server
-from extidd_py.protocols.message import Message
+from packerpy import Server
+from packerpy.protocols.message import Message
 
 
 def handle_message(message: Message, address) -> Message:
@@ -87,8 +87,8 @@ if __name__ == "__main__":
 
 ```python
 import asyncio
-from extidd_py import Client
-from extidd_py.protocols.message import Message
+from packerpy import Client
+from packerpy.protocols.message import Message
 
 
 async def main():
@@ -115,7 +115,7 @@ For more control, you can use the transport layer directly:
 ### TCP Server (Async)
 
 ```python
-from extidd_py.transports.tcp.async_server import AsyncTCPServer
+from packerpy.transports.tcp.async_server import AsyncTCPServer
 
 def echo_handler(data: bytes, address) -> bytes:
     return data
@@ -127,7 +127,7 @@ await server.start()
 ### TCP Client (Async)
 
 ```python
-from extidd_py.transports.tcp.async_client import AsyncTCPClient
+from packerpy.transports.tcp.async_client import AsyncTCPClient
 
 async with AsyncTCPClient("127.0.0.1", 8888) as client:
     await client.send(b"Hello!")

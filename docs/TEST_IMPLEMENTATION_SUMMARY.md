@@ -237,7 +237,7 @@ async def test_async(mock_open):
 ## Troubleshooting
 
 ### If Tests Don't Run
-1. Ensure you're in project root: `cd extidd`
+1. Ensure you're in project root: `cd packerpy`
 2. Install dependencies: `uv sync`
 3. Verify Python version: `python --version` (should be >=3.10)
 4. Check pytest is installed: `pytest --version`

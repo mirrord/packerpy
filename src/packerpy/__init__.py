@@ -1,4 +1,4 @@
-"""Network communications package for extidd_py."""
+"""Network communications package for packerpy."""
 
 from packerpy.client import Client
 from packerpy.server import Server
