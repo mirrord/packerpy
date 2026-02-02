@@ -1,0 +1,25 @@
+[project]
+name = "packerpy"
+version = "0.1.0"
+description = "A bitwise data packer and unpacker for Python focused on network communications."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [
+    {name = "Dane Howard", email = "dane.howard@prescientedge.us"},
+]
+dependencies = [
+
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+dev-dependencies = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "pytest-cov>=4.1.0",
+    "pytest-mock>=3.12.0",
+]
