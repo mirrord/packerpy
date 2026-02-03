@@ -2,7 +2,9 @@
 
 PackerPy now supports powerful field reference features that allow fields to automatically compute values from other fields during encoding/decoding. This enables declarative definitions of common protocol patterns like length prefixes, conditional fields, and computed checksums.
 
-**New**: Cross-partial field references allow you to reference fields inside `MessagePartial` objects using dot notation (e.g., `"header.payload_size"`), making it easy to create protocol headers that contain information about payloads.
+**New Features**:
+- **Cross-partial field references**: Reference fields inside `MessagePartial` objects using dot notation (e.g., `"header.payload_size"`)
+- **Deep assignments**: Automatically set nested fields within MessagePartials from the parent Message level (e.g., `"header.payload_length": {"length_of": "payload"}`)
 
 ## Overview
 
@@ -13,6 +15,7 @@ Field references allow you to:
 - **Conditional fields**: Include/exclude fields based on conditions
 - **Computed values**: Calculate field values from other fields
 - **Cross-partial references**: Reference fields inside MessagePartial objects using dot notation
+- **Deep assignments**: Set nested fields within MessagePartials declaratively
 
 ## Field Reference Types
 
@@ -508,6 +511,222 @@ fields = {
 }
 ```
 
+## Deep Assignment to Nested Fields
+
+**New Feature**: You can now assign values to nested fields within MessagePartial objects directly from the parent Message's field specification. This eliminates the need to manually set header fields after creating the message.
+
+### Basic Deep Assignment Syntax
+
+Use the field name followed by a dot and the nested field path as a key in the field spec:
+
+```python
+class Header(MessagePartial):
+    encoding = Encoding.BIG_ENDIAN
+    fields = {
+        "version": {"type": "uint(8)"},
+        "payload_length": {"type": "uint(32)"},
+    }
+
+class Payload(MessagePartial):
+    encoding = Encoding.BIG_ENDIAN
+    fields = {
+        "data": {"type": "bytes"},
+    }
+
+class Message(Message):
+    encoding = Encoding.BIG_ENDIAN
+    fields = {
+        "header": {
+            "type": Header,
+            "header.payload_length": {"length_of": "payload"}  # Deep assignment!
+        },
+        "payload": {"type": Payload}
+    }
+
+# Usage
+header = Header(version=1, payload_length=0)
+payload = Payload(data=b"Important data")
+msg = Message(header=header, payload=payload)
+
+# During serialization, header.payload_length is automatically computed
+serialized = msg.serialize_bytes()
+# Now header.payload_length contains the serialized size of payload
+```
+
+### Supported Deep Assignment Types
+
+All field reference types work with deep assignments:
+
+**1. `length_of` with Deep Assignment:**
+```python
+fields = {
+    "header": {
+        "type": HeaderPartial,
+        "header.data_len": {"length_of": "data"}  # Sets header.data_len
+    },
+    "data": {"type": "bytes"}
+}
+```
+
+**2. `size_of` with Deep Assignment:**
+```python
+fields = {
+    "header": {
+        "type": HeaderPartial,
+        "header.field_size": {"size_of": "field"}  # Sets header.field_size
+    },
+    "field": {"type": "int(64)"}
+}
+```
+
+**3. `compute` with Deep Assignment:**
+```python
+fields = {
+    "header": {
+        "type": HeaderPartial,
+        "header.checksum": {
+            "compute": lambda msg: sum(msg.payload) & 0xFFFFFFFF
+        }
+    },
+    "payload": {"type": "bytes"}
+}
+```
+
+### Multiple Deep Assignments
+
+You can specify multiple deep assignments for a single MessagePartial:
+
+```python
+class PacketHeader(MessagePartial):
+    fields = {
+        "payload_size": {"type": "uint(32)"},
+        "checksum": {"type": "uint(32)"},
+    }
+
+class Message(Message):
+    fields = {
+        "header": {
+            "type": PacketHeader,
+            "header.payload_size": {"length_of": "payload"},
+            "header.checksum": {
+                "compute": lambda msg: sum(msg.payload) & 0xFFFFFFFF
+            }
+        },
+        "payload": {"type": "bytes"}
+    }
+```
+
+### Deeply Nested Deep Assignments
+
+Deep assignments support multiple levels of nesting:
+
+```python
+class InnerConfig(MessagePartial):
+    fields = {"count": {"type": "uint(16)"}}
+
+class OuterConfig(MessagePartial):
+    fields = {"inner": {"type": InnerConfig}}
+
+class Message(Message):
+    fields = {
+        "config": {
+            "type": OuterConfig,
+            "config.inner.count": {"length_of": "items"}  # Two levels deep!
+        },
+        "items": {"type": "int(32)", "numlist": 5}
+    }
+```
+
+### Deep Assignment with Cross-Partial References
+
+Combine deep assignments with cross-partial references for maximum flexibility:
+
+```python
+class Header(MessagePartial):
+    fields = {"data_len": {"type": "uint(32)"}}
+
+class Payload(MessagePartial):
+    fields = {"data": {"type": "bytes"}}
+
+class Message(Message):
+    fields = {
+        "header": {
+            "type": Header,
+            "header.data_len": {"length_of": "payload.data"}  # Cross-partial!
+        },
+        "payload": {"type": Payload}
+    }
+```
+
+### Deep Assignment with Custom Serializers
+
+Deep assignments work seamlessly with custom serializers:
+
+```python
+from packerpy.protocols.serializer import BytesSerializer, JSONSerializer
+
+class Header(MessagePartial):
+    fields = {
+        "payload_length": {"type": "uint(32)"},
+    }
+
+class Payload(MessagePartial):
+    fields = {
+        "message": {"type": "str"},
+        "count": {"type": "int"},
+    }
+
+class Message(Message):
+    fields = {
+        "header": {
+            "type": Header,
+            "serializer": BytesSerializer(),
+            "header.payload_length": {"length_of": "payload"}  # Computes JSON size!
+        },
+        "payload": {"type": Payload, "serializer": JSONSerializer()}
+    }
+```
+
+### Real-World Example: Protocol Packet
+
+```python
+class PacketHeader(MessagePartial):
+    encoding = Encoding.BIG_ENDIAN
+    fields = {
+        "magic": {"type": "uint(16)"},
+        "version": {"type": "uint(8)"},
+        "payload_size": {"type": "uint(32)"},
+        "checksum": {"type": "uint(32)"},
+    }
+
+class PacketPayload(MessagePartial):
+    encoding = Encoding.BIG_ENDIAN
+    fields = {
+        "data": {"type": "bytes"},
+    }
+
+class ProtocolPacket(Message):
+    encoding = Encoding.BIG_ENDIAN
+    fields = {
+        "header": {
+            "type": PacketHeader,
+            "header.payload_size": {"length_of": "payload"},
+            "header.checksum": {
+                "compute": lambda msg: sum(msg.payload.data) & 0xFFFFFFFF
+            }
+        },
+        "payload": {"type": PacketPayload}
+    }
+
+# Usage - no manual header field setting needed!
+header = PacketHeader(magic=0xABCD, version=1, payload_size=0, checksum=0)
+payload = PacketPayload(data=b"Important data")
+packet = ProtocolPacket(header=header, payload=payload)
+
+# Serialize - header fields are computed automatically
+serialized = packet.serialize_bytes()
+```
+
 ## Performance Considerations
 
 - **Computed fields** are evaluated during serialization, adding minimal overhead
@@ -527,6 +746,7 @@ fields = {
 See the following examples for comprehensive working demonstrations:
 - [examples/field_references_demo.py](../examples/field_references_demo.py) - Basic field reference features
 - [examples/cross_partial_references_demo.py](../examples/cross_partial_references_demo.py) - Cross-partial field references with nested MessagePartials
+- [examples/deep_assignment_demo.py](../examples/deep_assignment_demo.py) - Deep assignments to automatically set nested fields
 
 ## Migration Guide
 
@@ -566,6 +786,12 @@ When using cross-partial references with dot notation, the nested field 'Y' does
 
 ### "Field 'X' is not a MessagePartial, cannot reference nested fields"
 You're trying to use dot notation on a field that isn't a MessagePartial. Only MessagePartial fields support nested field references.
+
+### "Deep assignment 'X.Y': field 'Y' not found"
+When using deep assignments, the nested field you're trying to assign to doesn't exist in the MessagePartial. Check the field name and ensure it's defined in the MessagePartial's fields dictionary.
+
+### "Deep assignment 'X.Y' must be a dictionary"
+Deep assignment specifications must be dictionaries containing field reference specs (like `{"length_of": "payload"}`). Check your field specification syntax.
 
 ### "Field 'X' references 'Y' which hasn't been parsed yet"
 During deserialization, field X needs field Y's value, but Y comes after X in the field order. Reorder your fields so Y comes before X.

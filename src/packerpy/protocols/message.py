@@ -137,6 +137,68 @@ class Message(ABC):
             raise ValueError(f"Referenced field '{field_ref}' does not exist")
         return getattr(self, field_ref)
 
+    def _apply_deep_assignments(
+        self, field_name: str, field_spec: Dict[str, Any], field_value: Any
+    ) -> None:
+        """
+        Apply deep assignments to nested fields within a MessagePartial.
+
+        Deep assignments allow setting nested fields from the parent Message level.
+        Example: "header.payload_length": {"length_of": "payload"}
+
+        Args:
+            field_name: Name of the field (e.g., "header")
+            field_spec: Field specification dictionary
+            field_value: The MessagePartial instance to apply assignments to
+        """
+        # Look for keys that start with field_name followed by a dot
+        prefix = f"{field_name}."
+
+        for key, assignment_spec in field_spec.items():
+            if isinstance(key, str) and key.startswith(prefix):
+                # This is a deep assignment like "header.payload_length"
+                nested_path = key[
+                    len(prefix) :
+                ]  # Extract "payload_length" from "header.payload_length"
+
+                # Compute the value using the assignment spec
+                if not isinstance(assignment_spec, dict):
+                    raise ValueError(
+                        f"Deep assignment '{key}' must be a dictionary with field reference specs"
+                    )
+
+                # Compute the value for this nested field
+                computed_value = self._compute_field_value(key, assignment_spec)
+
+                # Navigate to the target and set the value
+                if "." in nested_path:
+                    # Multiple levels like "inner.value"
+                    parts = nested_path.split(".")
+                    current = field_value
+
+                    # Navigate to the parent of the final field
+                    for part in parts[:-1]:
+                        if not hasattr(current, part):
+                            raise ValueError(
+                                f"Deep assignment '{key}': field '{part}' not found in {type(current).__name__}"
+                            )
+                        current = getattr(current, part)
+
+                    # Set the final field
+                    final_field = parts[-1]
+                    if not hasattr(current, final_field):
+                        raise ValueError(
+                            f"Deep assignment '{key}': field '{final_field}' not found in {type(current).__name__}"
+                        )
+                    setattr(current, final_field, computed_value)
+                else:
+                    # Single level like "payload_length"
+                    if not hasattr(field_value, nested_path):
+                        raise ValueError(
+                            f"Deep assignment '{key}': field '{nested_path}' not found in {type(field_value).__name__}"
+                        )
+                    setattr(field_value, nested_path, computed_value)
+
     def _compute_field_value(self, field_name: str, field_spec: Dict[str, Any]) -> Any:
         """
         Compute a field's value based on its specification.
@@ -165,6 +227,21 @@ class Message(ABC):
                 return len(target_value)
             elif isinstance(target_value, (str, bytes)):
                 return len(target_value)
+            elif isinstance(target_value, MessagePartial):
+                # For MessagePartial, compute serialized byte size
+                # Check if the target field has a custom serializer
+                target_field_name = (
+                    target_field.split(".")[0] if "." in target_field else target_field
+                )
+                target_spec = self.fields.get(target_field_name)
+
+                if target_spec and "serializer" in target_spec:
+                    # Use the custom serializer
+                    serializer = target_spec["serializer"]
+                    return len(serializer.serialize(target_value))
+                else:
+                    # Use standard serialization
+                    return len(target_value.serialize_bytes())
             else:
                 raise ValueError(
                     f"Cannot compute length of field '{target_field}' with type {type(target_value)}"
@@ -314,6 +391,12 @@ class Message(ABC):
                 setattr(self, field_name, value)
             else:
                 value = getattr(self, field_name)
+
+            # Apply deep assignments if this is a MessagePartial field
+            field_type = field_spec.get("type")
+            if isinstance(field_type, type) and issubclass(field_type, MessagePartial):
+                if isinstance(value, MessagePartial):
+                    self._apply_deep_assignments(field_name, field_spec, value)
 
             # Handle fixed-size arrays
             if "numlist" in field_spec:
