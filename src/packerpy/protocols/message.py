@@ -7,6 +7,7 @@ from packerpy.protocols.message_partial import (
     MessagePartial,
     Encoding,
     EnumEncoder,
+    FieldEncoder,
     BitPackingContext,
     BitUnpackingContext,
 )
@@ -104,12 +105,34 @@ class Message(ABC):
         """
         Resolve a field reference to get its value.
 
+        Supports cross-partial field references using dot notation:
+        - "data_length" - Simple field reference
+        - "header.version" - Field inside a MessagePartial
+        - "header.nested.value" - Nested MessagePartial references
+
         Args:
-            field_ref: Field name to resolve (e.g., "data_length")
+            field_ref: Field name to resolve (e.g., "data_length" or "header.version")
 
         Returns:
             The value of the referenced field
         """
+        # Check for cross-partial reference (dot notation)
+        if "." in field_ref:
+            parts = field_ref.split(".")
+            current = self
+
+            # Navigate through the path
+            for part in parts:
+                if not hasattr(current, part):
+                    raise ValueError(
+                        f"Referenced field '{field_ref}' does not exist: "
+                        f"'{part}' not found in {type(current).__name__}"
+                    )
+                current = getattr(current, part)
+
+            return current
+
+        # Simple field reference
         if not hasattr(self, field_ref):
             raise ValueError(f"Referenced field '{field_ref}' does not exist")
         return getattr(self, field_ref)
@@ -151,15 +174,85 @@ class Message(ABC):
         elif "size_of" in field_spec:
             target_field = field_spec["size_of"]
             target_value = self._resolve_field_reference(target_field)
-            target_spec = self.fields.get(target_field)
 
-            if target_spec is None:
-                raise ValueError(
-                    f"Target field '{target_field}' not found in field definitions"
+            # Handle cross-partial references
+            if "." in target_field:
+                # Parse the path to get the field spec
+                parts = target_field.split(".")
+                parent_field = parts[0]
+                nested_field = ".".join(parts[1:])
+
+                # Get the MessagePartial instance
+                parent = getattr(self, parent_field)
+                parent_spec = self.fields.get(parent_field)
+
+                if parent_spec is None:
+                    raise ValueError(
+                        f"Parent field '{parent_field}' not found in field definitions"
+                    )
+
+                # Get the MessagePartial class type
+                parent_type = parent_spec.get("type")
+                if not (
+                    isinstance(parent_type, type)
+                    and issubclass(parent_type, MessagePartial)
+                ):
+                    raise ValueError(
+                        f"Field '{parent_field}' is not a MessagePartial, cannot reference nested fields"
+                    )
+
+                # Navigate to get the nested field spec
+                if "." in nested_field:
+                    # Multiple levels of nesting
+                    nested_parts = nested_field.split(".")
+                    current_type = parent_type
+                    current_obj = parent
+
+                    for i, part in enumerate(nested_parts[:-1]):
+                        nested_spec = current_type.fields.get(part)
+                        if nested_spec is None:
+                            raise ValueError(
+                                f"Field '{part}' not found in {current_type.__name__}"
+                            )
+                        current_type = nested_spec.get("type")
+                        if not (
+                            isinstance(current_type, type)
+                            and issubclass(current_type, MessagePartial)
+                        ):
+                            raise ValueError(
+                                f"Field '{part}' is not a MessagePartial, cannot reference nested fields"
+                            )
+                        current_obj = getattr(current_obj, part)
+
+                    # Get the final field spec
+                    final_field = nested_parts[-1]
+                    target_spec = current_type.fields.get(final_field)
+                    parent = current_obj
+                else:
+                    # Single level nesting
+                    target_spec = parent_type.fields.get(nested_field)
+
+                if target_spec is None:
+                    raise ValueError(
+                        f"Target field '{nested_field}' not found in {parent_type.__name__}"
+                    )
+
+                # Serialize target field to get byte size using the MessagePartial's serialization
+                serialized = parent._serialize_value(
+                    target_value, target_spec, parent.encoding.value
                 )
+            else:
+                # Simple field reference (existing logic)
+                target_spec = self.fields.get(target_field)
 
-            # Serialize target field to get byte size
-            serialized = self._serialize_value(target_value, target_spec, byteorder)
+                if target_spec is None:
+                    raise ValueError(
+                        f"Target field '{target_field}' not found in field definitions"
+                    )
+
+                # Serialize target field to get byte size
+                serialized = self._serialize_value(target_value, target_spec, byteorder)
+
             return len(serialized)
 
         # Use value from another field
@@ -608,12 +701,32 @@ class Message(ABC):
             if "numlist" in field_spec:
                 numlist_param = field_spec["numlist"]
                 if isinstance(numlist_param, str) and not str(numlist_param).isdigit():
-                    # It's a field reference - look it up in already-parsed fields
-                    if numlist_param not in kwargs:
-                        raise ValueError(
-                            f"Field '{field_name}' references '{numlist_param}' which hasn't been parsed yet. Ensure field order is correct."
-                        )
-                    field_spec_resolved["numlist"] = kwargs[numlist_param]
+                    # It's a field reference - resolve it from already-parsed fields
+                    if "." in numlist_param:
+                        # Cross-partial reference - navigate through the path
+                        parts = numlist_param.split(".")
+                        if parts[0] not in kwargs:
+                            raise ValueError(
+                                f"Field '{field_name}' references '{numlist_param}' but '{parts[0]}' hasn't been parsed yet. Ensure field order is correct."
+                            )
+
+                        # Navigate through the path
+                        current = kwargs[parts[0]]
+                        for part in parts[1:]:
+                            if not hasattr(current, part):
+                                raise ValueError(
+                                    f"Field '{field_name}' references '{numlist_param}' but '{part}' not found in {type(current).__name__}"
+                                )
+                            current = getattr(current, part)
+
+                        field_spec_resolved["numlist"] = current
+                    else:
+                        # Simple field reference
+                        if numlist_param not in kwargs:
+                            raise ValueError(
+                                f"Field '{field_name}' references '{numlist_param}' which hasn't been parsed yet. Ensure field order is correct."
+                            )
+                        field_spec_resolved["numlist"] = kwargs[numlist_param]
 
             # Handle fixed-size arrays
             if "numlist" in field_spec_resolved:
@@ -724,13 +837,35 @@ class Message(ABC):
             size_param = field_spec["size"]
             if isinstance(size_param, str) and not size_param.isdigit():
                 # It's a field reference
-                if size_param not in context:
-                    raise ValueError(
-                        f"Field references '{size_param}' which hasn't been parsed yet. Ensure field order is correct."
-                    )
-                # Create modified spec with resolved size
-                field_spec = dict(field_spec)
-                field_spec["size"] = context[size_param]
+                if "." in size_param:
+                    # Cross-partial reference - navigate through the path
+                    parts = size_param.split(".")
+                    if parts[0] not in context:
+                        raise ValueError(
+                            f"Field references '{size_param}' but '{parts[0]}' hasn't been parsed yet. Ensure field order is correct."
+                        )
+
+                    # Navigate through the path
+                    current = context[parts[0]]
+                    for part in parts[1:]:
+                        if not hasattr(current, part):
+                            raise ValueError(
+                                f"Field references '{size_param}' but '{part}' not found in {type(current).__name__}"
+                            )
+                        current = getattr(current, part)
+
+                    # Create modified spec with resolved size
+                    field_spec = dict(field_spec)
+                    field_spec["size"] = current
+                else:
+                    # Simple field reference
+                    if size_param not in context:
+                        raise ValueError(
+                            f"Field references '{size_param}' which hasn't been parsed yet. Ensure field order is correct."
+                        )
+                    # Create modified spec with resolved size
+                    field_spec = dict(field_spec)
+                    field_spec["size"] = context[size_param]
 
         # Per-field serializer (for mixed serialization)
         if "serializer" in field_spec:
