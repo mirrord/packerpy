@@ -79,6 +79,11 @@ class Protocol:
         # Buffer for incomplete messages (keyed by connection/source identifier)
         self._incomplete_buffers: Dict[str, bytes] = {}
         self._buffer_lock = threading.Lock()
+        # Automatic headers and footers
+        self._headers: Dict[str, Dict[str, Any]] = {}
+        self._footers: Dict[str, Dict[str, Any]] = {}
+        self._header_lock = threading.Lock()
+        self._footer_lock = threading.Lock()
 
     def register(self, message_class: Type[Message]) -> Type[Message]:
         """
@@ -102,6 +107,141 @@ class Protocol:
 
         self._message_registry[message_type] = message_class
         return message_class
+
+    def set_headers(self, headers: Dict[str, Dict[str, Any]]) -> None:
+        """
+        Set automatic header fields to be prepended to every encoded message.
+
+        Headers are added BEFORE the message body during encoding and removed
+        during decoding. Header fields support all field reference features:
+        - length_of: Count fields present in message
+        - size_of: Get byte size of fields
+        - compute: Custom computation (e.g., CRC calculation)
+        - value_from: Copy value from another field
+
+        Args:
+            headers: Dict mapping header field names to field specifications.
+                    Specifications use the same format as Message.fields.
+
+        Example:
+            protocol.set_headers({
+                "field_count": {
+                    "type": "uint(8)",
+                    "compute": lambda msg: len([f for f in msg.fields.keys()
+                                                 if hasattr(msg, f)])
+                },
+                "payload_length": {
+                    "type": "uint(32)",
+                    "size_of": "body"
+                },
+                "checksum": {
+                    "type": "uint(32)",
+                    "compute": lambda msg: Protocol.crc32(msg.serialize_bytes())
+                }
+            })
+        """
+        with self._header_lock:
+            self._headers = dict(headers)
+
+    def set_footers(self, footers: Dict[str, Dict[str, Any]]) -> None:
+        """
+        Set automatic footer fields to be appended to every encoded message.
+
+        Footers are added AFTER the message body during encoding and removed
+        during decoding. Footer fields support all field reference features:
+        - length_of: Count fields present in message
+        - size_of: Get byte size of fields
+        - compute: Custom computation (e.g., CRC calculation)
+        - value_from: Copy value from another field
+
+        Args:
+            footers: Dict mapping footer field names to field specifications.
+                    Specifications use the same format as Message.fields.
+
+        Example:
+            protocol.set_footers({
+                "message_crc": {
+                    "type": "uint(32)",
+                    "compute": lambda msg: Protocol.crc32(msg.serialize_bytes())
+                },
+                "end_marker": {
+                    "type": "uint(16)",
+                    "static": 0xFFFF
+                }
+            })
+        """
+        with self._footer_lock:
+            self._footers = dict(footers)
+
+    def clear_headers(self) -> None:
+        """Remove all automatic headers."""
+        with self._header_lock:
+            self._headers = {}
+
+    def clear_footers(self) -> None:
+        """Remove all automatic footers."""
+        with self._footer_lock:
+            self._footers = {}
+
+    @staticmethod
+    def crc32(data: bytes, initial: int = 0) -> int:
+        """
+        Calculate CRC-32 checksum of data.
+
+        This is a convenience method for use in header/footer compute functions.
+
+        Args:
+            data: Bytes to calculate CRC for
+            initial: Initial CRC value (default 0)
+
+        Returns:
+            CRC-32 checksum as unsigned 32-bit integer
+        """
+        import zlib
+
+        return zlib.crc32(data, initial) & 0xFFFFFFFF
+
+    @staticmethod
+    def count_fields(message: Message) -> int:
+        """
+        Count the number of non-None fields in a message.
+
+        This is a convenience method for use in header/footer compute functions.
+
+        Args:
+            message: Message instance to count fields in
+
+        Returns:
+            Number of fields that have been set (not None)
+        """
+        count = 0
+        for field_name in message.fields.keys():
+            if hasattr(message, field_name):
+                value = getattr(message, field_name)
+                if value is not None:
+                    count += 1
+        return count
+
+    @staticmethod
+    def list_length(message: Message, field_name: str) -> int:
+        """
+        Get the length of a list field in a message.
+
+        This is a convenience method for use in header/footer compute functions.
+
+        Args:
+            message: Message instance
+            field_name: Name of the list field
+
+        Returns:
+            Length of the list, or 0 if field doesn't exist or is not a list
+        """
+        if not hasattr(message, field_name):
+            return 0
+        value = getattr(message, field_name)
+        if isinstance(value, list):
+            return len(value)
+        return 0
 
     def encode(self, message: Message) -> bytes:
         """
@@ -137,7 +277,216 @@ class Protocol:
         # Serialize message body
         message_bytes = message.serialize_bytes()
 
-        return type_header + message_bytes
+        # Add automatic headers
+        header_bytes = b""
+        with self._header_lock:
+            if self._headers:
+                header_bytes = self._serialize_auto_fields(
+                    self._headers, message, message_bytes
+                )
+
+        # Add automatic footers
+        footer_bytes = b""
+        with self._footer_lock:
+            if self._footers:
+                footer_bytes = self._serialize_auto_fields(
+                    self._footers, message, message_bytes
+                )
+
+        return type_header + header_bytes + message_bytes + footer_bytes
+
+    def _serialize_auto_fields(
+        self, fields: Dict[str, Dict[str, Any]], message: Message, message_bytes: bytes
+    ) -> bytes:
+        """
+        Serialize automatic header or footer fields.
+
+        Args:
+            fields: Field specifications (headers or footers)
+            message: The message being encoded
+            message_bytes: The serialized message body bytes
+
+        Returns:
+            Serialized field bytes
+        """
+        result = b""
+        byteorder = getattr(message, "encoding", None)
+        if byteorder:
+            byteorder = byteorder.value
+        else:
+            byteorder = "big"
+
+        # Create a temporary message-like object with computed values
+        class AutoFieldContext:
+            """Context object for computing auto field values."""
+
+            def __init__(self, msg: Message, msg_bytes: bytes):
+                self.message = msg
+                self.message_bytes = msg_bytes
+                # Copy message fields to this context
+                for field_name in msg.fields.keys():
+                    if hasattr(msg, field_name):
+                        setattr(self, field_name, getattr(msg, field_name))
+
+            def serialize_bytes(self) -> bytes:
+                """Return the message bytes."""
+                return self.message_bytes
+
+        context = AutoFieldContext(message, message_bytes)
+
+        for field_name, field_spec in fields.items():
+            # Compute field value
+            value = self._compute_auto_field_value(
+                field_name, field_spec, context, message, message_bytes
+            )
+
+            # Serialize the value
+            field_bytes = self._serialize_auto_field_value(
+                value, field_spec, byteorder, message
+            )
+            result += field_bytes
+
+        return result
+
+    def _compute_auto_field_value(
+        self,
+        field_name: str,
+        field_spec: Dict[str, Any],
+        context: Any,
+        message: Message,
+        message_bytes: bytes,
+    ) -> Any:
+        """
+        Compute the value for an automatic header/footer field.
+
+        Args:
+            field_name: Name of the field
+            field_spec: Field specification
+            context: Context object with message data
+            message: Original message instance
+            message_bytes: Serialized message bytes
+
+        Returns:
+            Computed field value
+        """
+        # Get byteorder from message
+        byteorder = getattr(message, "encoding", None)
+        if byteorder:
+            byteorder = byteorder.value
+        else:
+            byteorder = "big"
+
+        # Static value
+        if "static" in field_spec:
+            return field_spec["static"]
+
+        # Length of another field
+        if "length_of" in field_spec:
+            target_field = field_spec["length_of"]
+            target_value = self._resolve_auto_field_reference(
+                target_field, context, message
+            )
+
+            if isinstance(target_value, (bytes, str)):
+                return len(target_value)
+            elif isinstance(target_value, list):
+                return len(target_value)
+            else:
+                raise ValueError(
+                    f"length_of target '{target_field}' must be bytes, str, or list"
+                )
+
+        # Size of another field (in bytes)
+        if "size_of" in field_spec:
+            target_field = field_spec["size_of"]
+
+            # Special case: "body" or "message" refers to the whole message
+            if target_field in ("body", "message", "payload"):
+                return len(message_bytes)
+
+            target_value = self._resolve_auto_field_reference(
+                target_field, context, message
+            )
+            target_spec = message.fields.get(target_field, {})
+
+            # Serialize to get byte size
+            serialized = message._serialize_value(target_value, target_spec, byteorder)
+            return len(serialized)
+
+        # Value from another field
+        if "value_from" in field_spec:
+            source_field = field_spec["value_from"]
+            return self._resolve_auto_field_reference(source_field, context, message)
+
+        # Custom compute function
+        if "compute" in field_spec:
+            compute_fn = field_spec["compute"]
+            if not callable(compute_fn):
+                raise ValueError(f"Field '{field_name}': 'compute' must be callable")
+            return compute_fn(context)
+
+        # No value specified
+        raise ValueError(
+            f"Auto field '{field_name}' must have one of: static, length_of, size_of, value_from, compute"
+        )
+
+    def _resolve_auto_field_reference(
+        self, field_ref: str, context: Any, message: Message
+    ) -> Any:
+        """
+        Resolve a field reference in automatic header/footer context.
+
+        Args:
+            field_ref: Field reference (may include dot notation)
+            context: Context object
+            message: Original message
+
+        Returns:
+            Referenced field value
+        """
+        # Check for cross-field reference (dot notation)
+        if "." in field_ref:
+            parts = field_ref.split(".")
+            current = message
+
+            # Navigate through the path
+            for part in parts:
+                if not hasattr(current, part):
+                    raise ValueError(
+                        f"Referenced field '{field_ref}' does not exist: "
+                        f"'{part}' not found"
+                    )
+                current = getattr(current, part)
+
+            return current
+
+        # Simple field reference - check message first
+        if hasattr(message, field_ref):
+            return getattr(message, field_ref)
+
+        # Try context
+        if hasattr(context, field_ref):
+            return getattr(context, field_ref)
+
+        raise ValueError(f"Referenced field '{field_ref}' does not exist")
+
+    def _serialize_auto_field_value(
+        self, value: Any, field_spec: Dict[str, Any], byteorder: str, message: Message
+    ) -> bytes:
+        """
+        Serialize an automatic field value to bytes.
+
+        Args:
+            value: Value to serialize
+            field_spec: Field specification
+            byteorder: Byte order ('big' or 'little')
+            message: Original message (for _serialize_value compatibility)
+
+        Returns:
+            Serialized bytes
+        """
+        # Delegate to Message._serialize_value for consistency
+        return message._serialize_value(value, field_spec, byteorder)
 
     def decode(
         self, data: bytes, source_id: str = "default"
@@ -198,23 +547,77 @@ class Protocol:
 
             message_class = self._message_registry[message_type]
 
-            # Deserialize message body
+            # Get the data after the type header
             message_data = data[2 + type_length :]
 
+            # Calculate header size (if any headers configured)
+            header_size = 0
+            with self._header_lock:
+                if self._headers:
+                    header_size = self._calculate_auto_fields_size(
+                        self._headers, message_class
+                    )
+
+            # Check if we have enough data for headers
+            if len(message_data) < header_size:
+                with self._buffer_lock:
+                    self._incomplete_buffers[source_id] = data
+                return None
+
+            # Skip headers for now - we'll validate them after deserializing the message
+            message_body_start = header_size
+            message_data_body = message_data[message_body_start:]
+
+            # Deserialize message body
             try:
-                message, bytes_consumed = message_class.deserialize_bytes(message_data)
+                message, body_bytes_consumed = message_class.deserialize_bytes(
+                    message_data_body
+                )
             except Exception as deserialize_error:
                 # Check if this might be an incomplete message
                 # If we have very little data, it's likely incomplete
-                if len(message_data) < 10:  # Arbitrary threshold
+                if len(message_data_body) < 10:  # Arbitrary threshold
                     with self._buffer_lock:
                         self._incomplete_buffers[source_id] = data
                     return None
                 # Otherwise treat as invalid
                 raise deserialize_error
 
+            # Calculate footer size (if any footers configured)
+            footer_size = 0
+            with self._footer_lock:
+                if self._footers:
+                    footer_size = self._calculate_auto_fields_size(
+                        self._footers, message_class
+                    )
+
+            # Check if we have enough data for footers
+            footer_start = message_body_start + body_bytes_consumed
+            if len(message_data) < footer_start + footer_size:
+                with self._buffer_lock:
+                    self._incomplete_buffers[source_id] = data
+                return None
+
+            # Validate headers (if any)
+            if header_size > 0:
+                header_data = message_data[0:header_size]
+                with self._header_lock:
+                    self._validate_auto_fields(
+                        self._headers, header_data, message, message_class
+                    )
+
+            # Validate footers (if any)
+            if footer_size > 0:
+                footer_data = message_data[footer_start : footer_start + footer_size]
+                with self._footer_lock:
+                    self._validate_auto_fields(
+                        self._footers, footer_data, message, message_class
+                    )
+
             # Calculate remaining data
-            total_consumed = 2 + type_length + bytes_consumed
+            total_consumed = (
+                2 + type_length + header_size + body_bytes_consumed + footer_size
+            )
             remaining = data[total_consumed:]
 
             return (message, remaining)
@@ -230,6 +633,206 @@ class Protocol:
             # Return the invalid message with all remaining data
             # Caller can decide what to do with it
             return (invalid_msg, b"")
+
+    def _calculate_auto_fields_size(
+        self, fields: Dict[str, Dict[str, Any]], message_class: Type[Message]
+    ) -> int:
+        """
+        Calculate the total byte size of automatic header/footer fields.
+
+        This is used during decoding to determine how many bytes to skip/validate.
+
+        Args:
+            fields: Field specifications (headers or footers)
+            message_class: Message class being decoded
+
+        Returns:
+            Total size in bytes
+        """
+        total_size = 0
+        byteorder = getattr(message_class, "encoding", None)
+        if byteorder:
+            byteorder = byteorder.value
+        else:
+            byteorder = "big"
+
+        for field_name, field_spec in fields.items():
+            field_type = field_spec.get("type")
+
+            # For sized integer types like uint(8), int(32), etc.
+            if isinstance(field_type, str) and (
+                "int" in field_type or "uint" in field_type
+            ):
+                # Extract size from type string like "uint(32)"
+                if "(" in field_type and ")" in field_type:
+                    size_bits = int(field_type.split("(")[1].split(")")[0])
+                    total_size += size_bits // 8
+                else:
+                    # Default int size
+                    total_size += 4
+            # For basic types
+            elif field_type == "float":
+                total_size += 4
+            elif field_type == "double":
+                total_size += 8
+            elif field_type == "bool":
+                total_size += 1
+            # For custom encoders with a known size
+            elif "encoder" in field_spec:
+                encoder = field_spec["encoder"]
+                if hasattr(encoder, "size"):
+                    total_size += encoder.size
+                else:
+                    # Can't determine size statically
+                    raise ValueError(
+                        f"Cannot determine size of auto field '{field_name}' with custom encoder. "
+                        f"Encoder must have a 'size' attribute."
+                    )
+            else:
+                # Can't determine size for variable-length fields
+                raise ValueError(
+                    f"Cannot determine size of auto field '{field_name}'. "
+                    f"Auto fields must have fixed-size types (int, uint, float, double, bool)."
+                )
+
+        return total_size
+
+    def _validate_auto_fields(
+        self,
+        fields: Dict[str, Dict[str, Any]],
+        field_data: bytes,
+        message: Message,
+        message_class: Type[Message],
+    ) -> None:
+        """
+        Validate automatic header/footer fields during decoding.
+
+        Deserializes the fields and checks that computed fields match expected values.
+
+        Args:
+            fields: Field specifications (headers or footers)
+            field_data: Raw bytes containing the fields
+            message: Decoded message instance
+            message_class: Message class
+
+        Raises:
+            ValueError: If validation fails
+        """
+        offset = 0
+        byteorder = getattr(message_class, "encoding", None)
+        if byteorder:
+            byteorder = byteorder.value
+        else:
+            byteorder = "big"
+
+        # Get the original serialized message bytes for validation
+        message_bytes = message.serialize_bytes()
+
+        for field_name, field_spec in fields.items():
+            # Deserialize the field value
+            value, consumed = self._deserialize_auto_field_value(
+                field_data[offset:], field_spec, byteorder, message_class
+            )
+            offset += consumed
+
+            # For computed fields, verify the value matches
+            if any(
+                k in field_spec
+                for k in ["compute", "length_of", "size_of", "value_from"]
+            ):
+                # Compute what the value should be
+                class AutoFieldContext:
+                    """Context for validation."""
+
+                    def __init__(self, msg: Message, msg_bytes: bytes):
+                        self.message = msg
+                        self.message_bytes = msg_bytes
+                        for fname in msg.fields.keys():
+                            if hasattr(msg, fname):
+                                setattr(self, fname, getattr(msg, fname))
+
+                    def serialize_bytes(self) -> bytes:
+                        return self.message_bytes
+
+                context = AutoFieldContext(message, message_bytes)
+                expected_value = self._compute_auto_field_value(
+                    field_name, field_spec, context, message, message_bytes
+                )
+
+                # Compare values
+                if value != expected_value:
+                    raise ValueError(
+                        f"Auto field '{field_name}' validation failed: "
+                        f"expected {expected_value}, got {value}"
+                    )
+
+            # For static fields, verify the value matches
+            elif "static" in field_spec:
+                expected = field_spec["static"]
+                if value != expected:
+                    raise ValueError(
+                        f"Auto field '{field_name}' validation failed: "
+                        f"expected static value {expected}, got {value}"
+                    )
+
+    def _deserialize_auto_field_value(
+        self,
+        data: bytes,
+        field_spec: Dict[str, Any],
+        byteorder: str,
+        message_class: Type[Message],
+    ) -> Tuple[Any, int]:
+        """
+        Deserialize an automatic field value from bytes.
+
+        Args:
+            data: Bytes to deserialize from
+            field_spec: Field specification
+            byteorder: Byte order ('big' or 'little')
+            message_class: Message class (for compatibility)
+
+        Returns:
+            Tuple of (deserialized value, bytes consumed)
+        """
+        field_type = field_spec.get("type")
+
+        # For sized integer types
+        if isinstance(field_type, str):
+            if field_type.startswith("uint("):
+                size_bits = int(field_type.split("(")[1].split(")")[0])
+                size_bytes = size_bits // 8
+                value = int.from_bytes(data[:size_bytes], byteorder, signed=False)
+                return value, size_bytes
+            elif field_type.startswith("int("):
+                size_bits = int(field_type.split("(")[1].split(")")[0])
+                size_bytes = size_bits // 8
+                value = int.from_bytes(data[:size_bytes], byteorder, signed=True)
+                return value, size_bytes
+            elif field_type == "float":
+                import struct
+
+                fmt = "<f" if byteorder == "little" else ">f"
+                value = struct.unpack(fmt, data[:4])[0]
+                return value, 4
+            elif field_type == "double":
+                import struct
+
+                fmt = "<d" if byteorder == "little" else ">d"
+                value = struct.unpack(fmt, data[:8])[0]
+                return value, 8
+            elif field_type == "bool":
+                value = bool(data[0])
+                return value, 1
+
+        # Custom encoder
+        if "encoder" in field_spec:
+            encoder = field_spec["encoder"]
+            if hasattr(encoder, "decode"):
+                value = encoder.decode(data, byteorder)
+                size = getattr(encoder, "size", len(data))
+                return value, size
+
+        raise ValueError(f"Cannot deserialize auto field with type '{field_type}'")
 
     # Legacy method names for backward compatibility
     def encode_message(self, message: Message) -> bytes:

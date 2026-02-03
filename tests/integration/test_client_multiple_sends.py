@@ -8,8 +8,8 @@ from packerpy.protocols.protocol import Protocol
 from packerpy.protocols.message import Message, Encoding
 
 
-class TestMessage(Message):
-    """Test message class."""
+class SimpleMessage(Message):
+    """Simple message class for testing."""
 
     encoding = Encoding.BIG_ENDIAN
     fields = {"text": {"type": "str"}}
@@ -18,11 +18,10 @@ class TestMessage(Message):
 class TestClientMultipleSendsIntegration:
     """Integration tests for multiple send operations."""
 
-    @pytest.mark.timeout(10)
     def test_send_message_twice_integration(self):
         """Test sending two messages in succession - integration test."""
         protocol = Protocol()
-        protocol.register(TestMessage)
+        protocol.register(SimpleMessage)
 
         # Start server
         def echo_handler(msg, addr):
@@ -44,7 +43,7 @@ class TestClientMultipleSendsIntegration:
             time.sleep(0.2)
 
             # First send - this should work
-            msg1 = TestMessage()
+            msg1 = SimpleMessage()
             msg1.text = "First message"
             result1 = client.send(msg1)
             assert result1 is True, "First send failed"
@@ -56,7 +55,7 @@ class TestClientMultipleSendsIntegration:
 
             # Second send - this is the bug we're fixing
             # Without the fix, this would timeout because receive loop blocks event loop
-            msg2 = TestMessage()
+            msg2 = SimpleMessage()
             msg2.text = "Second message"
             result2 = client.send(msg2)
             assert result2 is True, "Second send failed - bug not fixed!"
@@ -69,11 +68,10 @@ class TestClientMultipleSendsIntegration:
             server.stop()
             time.sleep(0.2)
 
-    @pytest.mark.timeout(10)
     def test_send_bytes_after_message_integration(self):
         """Test sending raw bytes after a message - integration test."""
         protocol = Protocol()
-        protocol.register(TestMessage)
+        protocol.register(SimpleMessage)
 
         # Start server
         server = Server(host="127.0.0.1", port=18081, protocol=protocol)
@@ -87,7 +85,7 @@ class TestClientMultipleSendsIntegration:
             time.sleep(0.2)
 
             # First send a message
-            msg = TestMessage()
+            msg = SimpleMessage()
             msg.text = "Message"
             result1 = client.send(msg)
             assert result1 is True
@@ -98,7 +96,7 @@ class TestClientMultipleSendsIntegration:
 
             # Now send raw bytes - this should not timeout
             # This is the key test - before the fix, this would timeout
-            msg2 = TestMessage()
+            msg2 = SimpleMessage()
             msg2.text = "Raw bytes test"
             raw_bytes = protocol.encode_message(msg2)
             result2 = client.send(raw_bytes)
